@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Last Uploaded Image as Featured
  * Description: Imposta come featured image l'immagine più recente del contenuto o dell'articolo più recente di una categoria.
- * Version: 6.3
- * Author: Custom
+ * Version: 6.5
+ * Author: Davide Antonica
  */
 
 if (!defined('ABSPATH')) {
@@ -78,14 +78,15 @@ class LastUploadedImageFeatured {
         $image_id = $this->resolveImageId($post_id, $config);
         if (!$image_id) return $image_url;
 
-        $new_url = wp_get_attachment_url($image_id);
+        $new_url = $this->getSocialSafeImageUrl($image_id);
         return $new_url ?: $image_url;
     }
 
     /** Dati dell'immagine calcolata per la richiesta corrente, usati da endOgImageBuffer() */
-    private $og_pending_image_url    = '';
-    private $og_pending_image_width  = '';
-    private $og_pending_image_height = '';
+    private $og_pending_image_url      = ''; // versione jpg-safe, usata per og:image (LinkedIn non supporta webp)
+    private $og_pending_image_url_raw  = ''; // versione originale, usata per twitter:image (X gestisce bene il webp)
+    private $og_pending_image_width    = '';
+    private $og_pending_image_height   = '';
 
     /**
      * Inizia a bufferizzare l'output di wp_head SOLO se esiste davvero
@@ -106,13 +107,16 @@ class LastUploadedImageFeatured {
         $image_id = $this->resolveImageId($post_id, $config);
         if (!$image_id) return; // nessuna immagine trovata: non bufferizzare, non rimuovere nulla
 
-        $image_url = wp_get_attachment_url($image_id);
+        $image_url = $this->getSocialSafeImageUrl($image_id);
         if (!$image_url) return;
 
+        $raw_url = wp_get_attachment_url($image_id);
+
         $meta = wp_get_attachment_metadata($image_id);
-        $this->og_pending_image_url    = $image_url;
-        $this->og_pending_image_width  = $meta['width']  ?? '';
-        $this->og_pending_image_height = $meta['height'] ?? '';
+        $this->og_pending_image_url     = $image_url;
+        $this->og_pending_image_url_raw = $raw_url ?: $image_url;
+        $this->og_pending_image_width   = $meta['width']  ?? '';
+        $this->og_pending_image_height  = $meta['height'] ?? '';
 
         $this->og_buffer_active = true;
         ob_start();
@@ -157,15 +161,65 @@ class LastUploadedImageFeatured {
         if ($this->og_pending_image_height) echo '<meta property="og:image:height" content="' . esc_attr($this->og_pending_image_height) . '" />' . "\n";
 
         // Tag dedicati a X/Twitter: senza questi, X spesso non mostra
-        // l'immagine anche se og:image e' presente e corretto.
+        // l'immagine anche se og:image e' presente e corretto. X gestisce
+        // bene il webp, quindi qui usiamo l'URL originale (non convertito).
         echo '<meta name="twitter:card" content="summary_large_image" />' . "\n";
-        echo '<meta name="twitter:image" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        echo '<meta name="twitter:image" content="' . esc_url($this->og_pending_image_url_raw) . '" />' . "\n";
         echo "<!-- /Last Uploaded Image as Featured -->\n";
     }
 
     /**
-     * Logica centrale: dato post_id e config, restituisce l'image_id da usare.
+     * LinkedIn (e altri crawler) non supportano le immagini .webp come
+     * og:image e mostrano "nessuna immagine trovata" anche se il tag e'
+     * tecnicamente presente e corretto. Se l'attachment risolto e' un
+     * webp, proviamo a usare una sua eventuale variante jpg/png già
+     * presente nei metadati (WordPress spesso la genera come "sources"
+     * quando si usa un plugin di ottimizzazione immagini); altrimenti
+     * generiamo al volo un jpg accanto al file originale e lo serviamo.
      */
+    private function getSocialSafeImageUrl($attachment_id) {
+        $file_path = get_attached_file($attachment_id);
+        $mime      = get_post_mime_type($attachment_id);
+
+        if ($mime !== 'image/webp' || empty($file_path) || !file_exists($file_path)) {
+            return wp_get_attachment_url($attachment_id);
+        }
+
+        // Alcuni plugin di ottimizzazione salvano varianti jpg/png in "sources"
+        $meta = wp_get_attachment_metadata($attachment_id);
+        if (!empty($meta['sources'])) {
+            foreach (['image/jpeg', 'image/png'] as $preferred_mime) {
+                if (!empty($meta['sources'][$preferred_mime]['file'])) {
+                    $upload_dir = wp_upload_dir();
+                    $sub_dir    = trailingslashit(dirname(str_replace($upload_dir['basedir'] . '/', '', $file_path)));
+                    return trailingslashit($upload_dir['baseurl']) . $sub_dir . $meta['sources'][$preferred_mime]['file'];
+                }
+            }
+        }
+
+        // Fallback: generiamo un jpg accanto all'originale, una sola volta
+        $jpg_path = preg_replace('/\.webp$/i', '.jpg', $file_path);
+        $jpg_url  = preg_replace('/\.webp$/i', '.jpg', wp_get_attachment_url($attachment_id));
+
+        if (!file_exists($jpg_path)) {
+            if (function_exists('imagecreatefromwebp') && function_exists('imagejpeg')) {
+                $image = @imagecreatefromwebp($file_path);
+                if ($image) {
+                    // sfondo bianco per evitare bordi neri su webp con trasparenza
+                    $bg = imagecreatetruecolor(imagesx($image), imagesy($image));
+                    imagefill($bg, 0, 0, imagecolorallocate($bg, 255, 255, 255));
+                    imagecopy($bg, $image, 0, 0, 0, 0, imagesx($image), imagesy($image));
+                    imagejpeg($bg, $jpg_path, 90);
+                    imagedestroy($image);
+                    imagedestroy($bg);
+                }
+            }
+        }
+
+        return file_exists($jpg_path) ? $jpg_url : wp_get_attachment_url($attachment_id);
+    }
+
+
     private function resolveImageId($post_id, $config) {
         $image_id = false;
 
