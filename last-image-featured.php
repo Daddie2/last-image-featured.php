@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Last Uploaded Image as Featured
  * Description: Imposta come featured image l'immagine più recente del contenuto o dell'articolo più recente di una categoria.
- * Version: 6.5
+ * Version: 6.6
  * Author: Davide Antonica
  */
 
@@ -128,6 +128,9 @@ class LastUploadedImageFeatured {
      * unico og:image corretto, evitando duplicati che confondono
      * i crawler (in particolare quello di LinkedIn, che tende a
      * leggere il PRIMO tag trovato e non l'ultimo).
+     * 
+     * Aggiunge anche il tag name="image" richiesto da Pinterest
+     * per la corretta visualizzazione delle immagini condivise.
      */
     public function endOgImageBuffer() {
         if (empty($this->og_buffer_active)) return;
@@ -155,8 +158,18 @@ class LastUploadedImageFeatured {
         if (empty($this->og_pending_image_url)) return;
 
         echo "\n<!-- Last Uploaded Image as Featured: og:image override -->\n";
+        
+        // META TAG PRINCIPALI
+        // og:image standard per Facebook/Open Graph
         echo '<meta property="og:image" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        
+        // Tag specifico per Pinterest (name="image" + property="og:image")
+        echo '<meta name="image" property="og:image" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        
+        // og:image:secure_url per HTTPS
         echo '<meta property="og:image:secure_url" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        
+        // Dimensioni dell'immagine
         if ($this->og_pending_image_width)  echo '<meta property="og:image:width" content="'  . esc_attr($this->og_pending_image_width)  . '" />' . "\n";
         if ($this->og_pending_image_height) echo '<meta property="og:image:height" content="' . esc_attr($this->og_pending_image_height) . '" />' . "\n";
 
