@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Last Uploaded Image as Featured
  * Description: Imposta come featured image l'immagine più recente del contenuto o dell'articolo più recente di una categoria.
- * Version: 6.0
+ * Version: 6.3
  * Author: Custom
  */
 
@@ -13,6 +13,8 @@ if (!defined('ABSPATH')) {
 class LastUploadedImageFeatured {
 
     private static $instance = null;
+
+    private $og_buffer_active = false;
 
     public static function getInstance() {
         if (self::$instance === null) {
@@ -31,8 +33,13 @@ class LastUploadedImageFeatured {
         add_filter('wpseo_opengraph_image',     [$this, 'overrideYoastOgImage'], 999);
         add_filter('wpseo_opengraph_image_url', [$this, 'overrideYoastOgImage'], 999);
 
-        // Fallback generico: stampa og:image dopo qualsiasi plugin SEO
-        add_action('wp_head', [$this, 'printOgImageOverride'], 99999);
+        // Fallback generico: intercetta l'intero <head>, rimuove QUALSIASI
+        // og:image duplicato (di Yoast, del tema, di altri plugin) e stampa
+        // solo il nostro. LinkedIn, a differenza di Facebook, spesso legge
+        // il PRIMO tag og:image trovato nella pagina, non l'ultimo: quindi
+        // limitarsi ad "aggiungere in fondo" non risolve il problema.
+        add_action('wp_head', [$this, 'startOgImageBuffer'], 0);
+        add_action('wp_head', [$this, 'endOgImageBuffer'], PHP_INT_MAX);
     }
 
     // =========================================================================
@@ -75,12 +82,19 @@ class LastUploadedImageFeatured {
         return $new_url ?: $image_url;
     }
 
+    /** Dati dell'immagine calcolata per la richiesta corrente, usati da endOgImageBuffer() */
+    private $og_pending_image_url    = '';
+    private $og_pending_image_width  = '';
+    private $og_pending_image_height = '';
+
     /**
-     * Fallback generico: stampa og:image in fondo all'head dopo qualsiasi plugin SEO.
-     * Necessario per plugin SEO diversi da Yoast che non espongono filtri sull'immagine.
-     * Nota: i crawler leggono l'ULTIMO og:image trovato nella pagina.
+     * Inizia a bufferizzare l'output di wp_head SOLO se esiste davvero
+     * un'immagine sostitutiva valida. Se non troviamo nessuna immagine
+     * (e non c'e' un fallback impostato), NON tocchiamo l'head: meglio
+     * lasciare l'eventuale og:image di Yoast/tema che cancellarlo senza
+     * rimpiazzo, altrimenti la pagina resta senza og:image del tutto.
      */
-    public function printOgImageOverride() {
+    public function startOgImageBuffer() {
         if (is_admin()) return;
 
         $post_id = get_queried_object_id();
@@ -90,19 +104,62 @@ class LastUploadedImageFeatured {
         if (!$config) return;
 
         $image_id = $this->resolveImageId($post_id, $config);
-        if (!$image_id) return;
+        if (!$image_id) return; // nessuna immagine trovata: non bufferizzare, non rimuovere nulla
 
         $image_url = wp_get_attachment_url($image_id);
         if (!$image_url) return;
 
         $meta = wp_get_attachment_metadata($image_id);
-        $width  = $meta['width']  ?? '';
-        $height = $meta['height'] ?? '';
+        $this->og_pending_image_url    = $image_url;
+        $this->og_pending_image_width  = $meta['width']  ?? '';
+        $this->og_pending_image_height = $meta['height'] ?? '';
+
+        $this->og_buffer_active = true;
+        ob_start();
+    }
+
+    /**
+     * Chiude il buffer di wp_head, rimuove qualsiasi tag og:image
+     * gia' presente (Yoast, tema, altri plugin SEO) e stampa un
+     * unico og:image corretto, evitando duplicati che confondono
+     * i crawler (in particolare quello di LinkedIn, che tende a
+     * leggere il PRIMO tag trovato e non l'ultimo).
+     */
+    public function endOgImageBuffer() {
+        if (empty($this->og_buffer_active)) return;
+
+        $head_content = ob_get_clean();
+        $this->og_buffer_active = false;
+
+        // Rimuove qualsiasi og:image / og:image:* già presente nell'head
+        $head_content = preg_replace(
+            '/<meta[^>]+property=["\']og:image(:width|:height|:secure_url|:type)?["\'][^>]*>\s*/i',
+            '',
+            $head_content
+        );
+
+        // Rimuove anche eventuali twitter:image / twitter:card già presenti
+        // (es. stampati da Yoast), per evitare tag duplicati/in conflitto
+        $head_content = preg_replace(
+            '/<meta[^>]+name=["\']twitter:(image|card)["\'][^>]*>\s*/i',
+            '',
+            $head_content
+        );
+
+        echo $head_content;
+
+        if (empty($this->og_pending_image_url)) return;
 
         echo "\n<!-- Last Uploaded Image as Featured: og:image override -->\n";
-        echo '<meta property="og:image" content="' . esc_url($image_url) . '" />' . "\n";
-        if ($width)  echo '<meta property="og:image:width" content="'  . esc_attr($width)  . '" />' . "\n";
-        if ($height) echo '<meta property="og:image:height" content="' . esc_attr($height) . '" />' . "\n";
+        echo '<meta property="og:image" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        echo '<meta property="og:image:secure_url" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
+        if ($this->og_pending_image_width)  echo '<meta property="og:image:width" content="'  . esc_attr($this->og_pending_image_width)  . '" />' . "\n";
+        if ($this->og_pending_image_height) echo '<meta property="og:image:height" content="' . esc_attr($this->og_pending_image_height) . '" />' . "\n";
+
+        // Tag dedicati a X/Twitter: senza questi, X spesso non mostra
+        // l'immagine anche se og:image e' presente e corretto.
+        echo '<meta name="twitter:card" content="summary_large_image" />' . "\n";
+        echo '<meta name="twitter:image" content="' . esc_url($this->og_pending_image_url) . '" />' . "\n";
         echo "<!-- /Last Uploaded Image as Featured -->\n";
     }
 
